@@ -6,7 +6,7 @@ import { NextRequest } from "next/server";
  *
  * NOTE:
  * - This returns a plain text stream wrapped as an SSE data stream (single channel),
- *   which is suitable for manual consumers or debugging. The main chat UI still uses /api/chat.
+ *   which is suitable for manual consumers or debugging.
  * - Set AI_TEST_BASE_URL to point to the Flask server (e.g. http://localhost:5000).
  */
 export async function POST(request: NextRequest) {
