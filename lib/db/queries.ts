@@ -37,12 +37,37 @@ import { generateHashedPassword } from "./utils";
 // Optionally, if not using email/pass login, you can
 // use the Drizzle adapter for Auth.js / NextAuth
 // https://authjs.dev/reference/adapter/drizzle
+const isMemoryMode = !process.env.POSTGRES_URL;
 
-// biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(process.env.POSTGRES_URL!);
-const db = drizzle(client);
+type StreamRow = { id: string; chatId: string; createdAt: Date };
+type DocumentRow = import("./schema").Document;
+type VoteRow = import("./schema").Vote;
+
+// In-memory fallback store (activated when POSTGRES_URL is not set)
+const memory = {
+  users: [] as User[],
+  chats: [] as Chat[],
+  messages: [] as DBMessage[],
+  votes: [] as VoteRow[],
+  documents: [] as DocumentRow[],
+  suggestions: [] as Suggestion[],
+  streams: [] as StreamRow[],
+};
+
+// Only initialize Postgres/Drizzle when a URL is provided
+const db = (() => {
+  if (isMemoryMode) {
+    return null as unknown as ReturnType<typeof drizzle>;
+  }
+  // biome-ignore lint: Forbidden non-null assertion.
+  const client = postgres(process.env.POSTGRES_URL!);
+  return drizzle(client);
+})();
 
 export async function getUser(email: string): Promise<User[]> {
+  if (isMemoryMode) {
+    return memory.users.filter((u) => u.email === email);
+  }
   try {
     return await db.select().from(user).where(eq(user.email, email));
   } catch (_error) {
@@ -56,6 +81,17 @@ export async function getUser(email: string): Promise<User[]> {
 export async function createUser(email: string, password: string) {
   const hashedPassword = generateHashedPassword(password);
 
+  if (isMemoryMode) {
+    const newUser: User = {
+      // Generate a UUID consistent with schema expectations
+      id: generateUUID(),
+      email,
+      password: hashedPassword,
+    };
+    memory.users.push(newUser);
+    return;
+  }
+
   try {
     return await db.insert(user).values({ email, password: hashedPassword });
   } catch (_error) {
@@ -66,6 +102,16 @@ export async function createUser(email: string, password: string) {
 export async function createGuestUser() {
   const email = `guest-${Date.now()}`;
   const password = generateHashedPassword(generateUUID());
+
+  if (isMemoryMode) {
+    const newUser: User = {
+      id: generateUUID(),
+      email,
+      password,
+    };
+    memory.users.push(newUser);
+    return [{ id: newUser.id, email: newUser.email }];
+  }
 
   try {
     return await db.insert(user).values({ email, password }).returning({
@@ -91,6 +137,18 @@ export async function saveChat({
   title: string;
   visibility: VisibilityType;
 }) {
+  if (isMemoryMode) {
+    const newChat: Chat = {
+      id,
+      createdAt: new Date(),
+      userId,
+      title,
+      visibility,
+      lastContext: null,
+    };
+    memory.chats.push(newChat);
+    return;
+  }
   try {
     return await db.insert(chat).values({
       id,
@@ -105,6 +163,17 @@ export async function saveChat({
 }
 
 export async function deleteChatById({ id }: { id: string }) {
+  if (isMemoryMode) {
+    memory.votes = memory.votes.filter((v) => v.chatId !== id);
+    memory.messages = memory.messages.filter((m) => m.chatId !== id);
+    memory.streams = memory.streams.filter((s) => s.chatId !== id);
+    const index = memory.chats.findIndex((c) => c.id === id);
+    if (index >= 0) {
+      const [deleted] = memory.chats.splice(index, 1);
+      return deleted;
+    }
+    return undefined;
+  }
   try {
     await db.delete(vote).where(eq(vote.chatId, id));
     await db.delete(message).where(eq(message.chatId, id));
@@ -124,6 +193,18 @@ export async function deleteChatById({ id }: { id: string }) {
 }
 
 export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
+  if (isMemoryMode) {
+    const userChatIds = memory.chats.filter((c) => c.userId === userId).map((c) => c.id);
+    if (userChatIds.length === 0) {
+      return { deletedCount: 0 };
+    }
+    memory.votes = memory.votes.filter((v) => !userChatIds.includes(v.chatId));
+    memory.messages = memory.messages.filter((m) => !userChatIds.includes(m.chatId));
+    memory.streams = memory.streams.filter((s) => !userChatIds.includes(s.chatId));
+    const before = memory.chats.length;
+    memory.chats = memory.chats.filter((c) => c.userId !== userId);
+    return { deletedCount: before - memory.chats.length };
+  }
   try {
     const userChats = await db
       .select({ id: chat.id })
@@ -134,7 +215,7 @@ export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
       return { deletedCount: 0 };
     }
 
-    const chatIds = userChats.map(c => c.id);
+    const chatIds = userChats.map((c) => c.id);
 
     await db.delete(vote).where(inArray(vote.chatId, chatIds));
     await db.delete(message).where(inArray(message.chatId, chatIds));
@@ -165,6 +246,42 @@ export async function getChatsByUserId({
   startingAfter: string | null;
   endingBefore: string | null;
 }) {
+  if (isMemoryMode) {
+    const extendedLimit = limit + 1;
+    const sorted = memory.chats
+      .filter((c) => c.userId === id)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+    let filteredChats: Chat[] = [];
+
+    if (startingAfter) {
+      const selectedChat = memory.chats.find((c) => c.id === startingAfter);
+      if (!selectedChat) {
+        throw new ChatSDKError(
+          "not_found:database",
+          `Chat with id ${startingAfter} not found`
+        );
+      }
+      filteredChats = sorted.filter((c) => c.createdAt > selectedChat.createdAt).slice(0, extendedLimit);
+    } else if (endingBefore) {
+      const selectedChat = memory.chats.find((c) => c.id === endingBefore);
+      if (!selectedChat) {
+        throw new ChatSDKError(
+          "not_found:database",
+          `Chat with id ${endingBefore} not found`
+        );
+      }
+      filteredChats = sorted.filter((c) => c.createdAt < selectedChat.createdAt).slice(0, extendedLimit);
+    } else {
+      filteredChats = sorted.slice(0, extendedLimit);
+    }
+
+    const hasMore = filteredChats.length > limit;
+    return {
+      chats: hasMore ? filteredChats.slice(0, limit) : filteredChats,
+      hasMore,
+    };
+  }
   try {
     const extendedLimit = limit + 1;
 
@@ -231,6 +348,10 @@ export async function getChatsByUserId({
 }
 
 export async function getChatById({ id }: { id: string }) {
+  if (isMemoryMode) {
+    const selectedChat = memory.chats.find((c) => c.id === id);
+    return selectedChat ?? null;
+  }
   try {
     const [selectedChat] = await db.select().from(chat).where(eq(chat.id, id));
     if (!selectedChat) {
@@ -244,6 +365,12 @@ export async function getChatById({ id }: { id: string }) {
 }
 
 export async function saveMessages({ messages }: { messages: DBMessage[] }) {
+  if (isMemoryMode) {
+    for (const msg of messages) {
+      memory.messages.push({ ...msg });
+    }
+    return;
+  }
   try {
     return await db.insert(message).values(messages);
   } catch (_error) {
@@ -252,6 +379,11 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
 }
 
 export async function getMessagesByChatId({ id }: { id: string }) {
+  if (isMemoryMode) {
+    return memory.messages
+      .filter((m) => m.chatId === id)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
   try {
     return await db
       .select()
@@ -275,6 +407,19 @@ export async function voteMessage({
   messageId: string;
   type: "up" | "down";
 }) {
+  if (isMemoryMode) {
+    const existing = memory.votes.find((v) => v.messageId === messageId && v.chatId === chatId);
+    if (existing) {
+      existing.isUpvoted = type === "up";
+      return;
+    }
+    memory.votes.push({
+      chatId,
+      messageId,
+      isUpvoted: type === "up",
+    } as VoteRow);
+    return;
+  }
   try {
     const [existingVote] = await db
       .select()
@@ -298,6 +443,9 @@ export async function voteMessage({
 }
 
 export async function getVotesByChatId({ id }: { id: string }) {
+  if (isMemoryMode) {
+    return memory.votes.filter((v) => v.chatId === id);
+  }
   try {
     return await db.select().from(vote).where(eq(vote.chatId, id));
   } catch (_error) {
@@ -321,6 +469,18 @@ export async function saveDocument({
   content: string;
   userId: string;
 }) {
+  if (isMemoryMode) {
+    const row: DocumentRow = {
+      id,
+      title,
+      kind,
+      content,
+      userId,
+      createdAt: new Date(),
+    } as unknown as DocumentRow;
+    memory.documents.push(row);
+    return [row];
+  }
   try {
     return await db
       .insert(document)
@@ -339,6 +499,11 @@ export async function saveDocument({
 }
 
 export async function getDocumentsById({ id }: { id: string }) {
+  if (isMemoryMode) {
+    return memory.documents
+      .filter((d) => d.id === id)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
   try {
     const documents = await db
       .select()
@@ -356,6 +521,12 @@ export async function getDocumentsById({ id }: { id: string }) {
 }
 
 export async function getDocumentById({ id }: { id: string }) {
+  if (isMemoryMode) {
+    const selected = memory.documents
+      .filter((d) => d.id === id)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+    return selected ?? undefined;
+  }
   try {
     const [selectedDocument] = await db
       .select()
@@ -379,6 +550,20 @@ export async function deleteDocumentsByIdAfterTimestamp({
   id: string;
   timestamp: Date;
 }) {
+  if (isMemoryMode) {
+    memory.suggestions = memory.suggestions.filter(
+      (s) => !(s.documentId === id && s.documentCreatedAt > timestamp),
+    );
+    const before = memory.documents.length;
+    const deleted: DocumentRow[] = [];
+    memory.documents = memory.documents.filter((d) => {
+      const shouldDelete = d.id === id && d.createdAt > timestamp;
+      if (shouldDelete) deleted.push(d);
+      return !shouldDelete;
+    });
+    void before; // satisfy linter for unused variable
+    return deleted;
+  }
   try {
     await db
       .delete(suggestion)
@@ -406,6 +591,12 @@ export async function saveSuggestions({
 }: {
   suggestions: Suggestion[];
 }) {
+  if (isMemoryMode) {
+    for (const s of suggestions) {
+      memory.suggestions.push({ ...s });
+    }
+    return;
+  }
   try {
     return await db.insert(suggestion).values(suggestions);
   } catch (_error) {
@@ -421,6 +612,9 @@ export async function getSuggestionsByDocumentId({
 }: {
   documentId: string;
 }) {
+  if (isMemoryMode) {
+    return memory.suggestions.filter((s) => s.documentId === documentId);
+  }
   try {
     return await db
       .select()
@@ -435,6 +629,9 @@ export async function getSuggestionsByDocumentId({
 }
 
 export async function getMessageById({ id }: { id: string }) {
+  if (isMemoryMode) {
+    return memory.messages.filter((m) => m.id === id);
+  }
   try {
     return await db.select().from(message).where(eq(message.id, id));
   } catch (_error) {
@@ -452,6 +649,20 @@ export async function deleteMessagesByChatIdAfterTimestamp({
   chatId: string;
   timestamp: Date;
 }) {
+  if (isMemoryMode) {
+    const toDelete = memory.messages
+      .filter((m) => m.chatId === chatId && m.createdAt >= timestamp)
+      .map((m) => m.id);
+    if (toDelete.length > 0) {
+      memory.votes = memory.votes.filter(
+        (v) => !(v.chatId === chatId && toDelete.includes(v.messageId)),
+      );
+      memory.messages = memory.messages.filter(
+        (m) => !(m.chatId === chatId && toDelete.includes(m.id)),
+      );
+    }
+    return;
+  }
   try {
     const messagesToDelete = await db
       .select({ id: message.id })
@@ -492,6 +703,13 @@ export async function updateChatVisibilityById({
   chatId: string;
   visibility: "private" | "public";
 }) {
+  if (isMemoryMode) {
+    const target = memory.chats.find((c) => c.id === chatId);
+    if (target) {
+      target.visibility = visibility;
+    }
+    return;
+  }
   try {
     return await db.update(chat).set({ visibility }).where(eq(chat.id, chatId));
   } catch (_error) {
@@ -510,6 +728,15 @@ export async function updateChatLastContextById({
   // Store merged server-enriched usage object
   context: AppUsage;
 }) {
+  if (isMemoryMode) {
+    const target = memory.chats.find((c) => c.id === chatId);
+    if (target) {
+      // Store merged server-enriched usage object
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      target.lastContext = context as any;
+    }
+    return;
+  }
   try {
     return await db
       .update(chat)
@@ -528,6 +755,18 @@ export async function getMessageCountByUserId({
   id: string;
   differenceInHours: number;
 }) {
+  if (isMemoryMode) {
+    const since = new Date(Date.now() - differenceInHours * 60 * 60 * 1000);
+    let countTotal = 0;
+    for (const m of memory.messages) {
+      if (m.role !== "user") continue;
+      const parent = memory.chats.find((c) => c.id === m.chatId);
+      if (!parent) continue;
+      if (parent.userId !== id) continue;
+      if (m.createdAt >= since) countTotal += 1;
+    }
+    return countTotal;
+  }
   try {
     const twentyFourHoursAgo = new Date(
       Date.now() - differenceInHours * 60 * 60 * 1000
@@ -562,6 +801,10 @@ export async function createStreamId({
   streamId: string;
   chatId: string;
 }) {
+  if (isMemoryMode) {
+    memory.streams.push({ id: streamId, chatId, createdAt: new Date() });
+    return;
+  }
   try {
     await db
       .insert(stream)
@@ -575,6 +818,12 @@ export async function createStreamId({
 }
 
 export async function getStreamIdsByChatId({ chatId }: { chatId: string }) {
+  if (isMemoryMode) {
+    return memory.streams
+      .filter((s) => s.chatId === chatId)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .map((s) => s.id);
+  }
   try {
     const streamIds = await db
       .select({ id: stream.id })
